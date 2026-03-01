@@ -1,9 +1,20 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { CSV_TOOL_DECLARATIONS } from './csvTools';
+import { YOUTUBE_TOOL_DECLARATIONS } from './youtubeTools';
 
 const genAI = new GoogleGenerativeAI(process.env.REACT_APP_GEMINI_API_KEY || '');
 
-const MODEL = 'gemini-2.0-flash';
+const MODEL = 'gemini-2.5-flash';
+const API_OPTIONS = { apiVersion: 'v1' };
+// Streaming with tools (Google Search / code execution) must use v1beta; v1 rejects "tools" on streamGenerateContent.
+const STREAM_API_OPTIONS = { apiVersion: 'v1beta' };
+
+// Cap history so total request stays under model token limit (e.g. 1M).
+const MAX_HISTORY_MESSAGES = 24;
+function capHistory(history) {
+  if (!Array.isArray(history) || history.length <= MAX_HISTORY_MESSAGES) return history;
+  return history.slice(-MAX_HISTORY_MESSAGES);
+}
 
 const SEARCH_TOOL = { googleSearch: {} };
 const CODE_EXEC_TOOL = { codeExecution: {} };
@@ -33,15 +44,19 @@ async function loadSystemPrompt() {
 // useCodeExecution: pass true to use codeExecution tool (CSV/analysis),
 //                   false (default) to use googleSearch tool.
 // Note: Gemini does not support both tools simultaneously.
-export const streamChat = async function* (history, newMessage, imageParts = [], useCodeExecution = false) {
-  const systemInstruction = await loadSystemPrompt();
+// userDisplayName: optional "FirstName LastName" — injected into system instruction so the AI addresses the user by name.
+export const streamChat = async function* (history, newMessage, imageParts = [], useCodeExecution = false, userDisplayName = '') {
+  let systemInstruction = await loadSystemPrompt();
+  if (userDisplayName && userDisplayName.trim()) {
+    systemInstruction += `\n\nThe user you are talking to is: ${userDisplayName.trim()}. Address them by name in your first message.`;
+  }
   const tools = useCodeExecution ? [CODE_EXEC_TOOL] : [SEARCH_TOOL];
-  const model = genAI.getGenerativeModel({
-    model: MODEL,
-    tools,
-  });
+  const model = genAI.getGenerativeModel(
+    { model: MODEL, tools },
+    STREAM_API_OPTIONS
+  );
 
-  const baseHistory = history.map((m) => ({
+  const baseHistory = capHistory(history).map((m) => ({
     role: m.role === 'user' ? 'user' : 'model',
     parts: [{ text: m.content || '' }],
   }));
@@ -128,14 +143,17 @@ export const streamChat = async function* (history, newMessage, imageParts = [],
 // executeFn(toolName, args) → plain JS object with the result
 // Returns the final text response from the model.
 
-export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeFn) => {
-  const systemInstruction = await loadSystemPrompt();
-  const model = genAI.getGenerativeModel({
-    model: MODEL,
-    tools: [{ functionDeclarations: CSV_TOOL_DECLARATIONS }],
-  });
+export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeFn, userDisplayName = '') => {
+  let systemInstruction = await loadSystemPrompt();
+  if (userDisplayName && userDisplayName.trim()) {
+    systemInstruction += `\n\nThe user you are talking to is: ${userDisplayName.trim()}. Address them by name in your first message.`;
+  }
+  const model = genAI.getGenerativeModel(
+    { model: MODEL, tools: [{ functionDeclarations: CSV_TOOL_DECLARATIONS }] },
+    STREAM_API_OPTIONS
+  );
 
-  const baseHistory = history.map((m) => ({
+  const baseHistory = capHistory(history).map((m) => ({
     role: m.role === 'user' ? 'user' : 'model',
     parts: [{ text: m.content || '' }],
   }));
@@ -191,4 +209,93 @@ export const chatWithCsvTools = async (history, newMessage, csvHeaders, executeF
   }
 
   return { text: response.text(), charts, toolCalls };
+};
+
+// ── Function-calling chat for YouTube tools ─────────────────────────────────
+// executeFn(toolName, args) → Promise<plain JS object> (e.g. generateImage calls backend)
+// Returns { text, charts, toolCalls, generatedImages }.
+
+// imageParts: optional array of { mimeType, data } for user-attached images (e.g. anchor for generateImage)
+export const chatWithYouTubeTools = async (history, newMessage, channelJsonSummary, executeFn, userDisplayName = '', imageParts = []) => {
+  let systemInstruction = await loadSystemPrompt();
+  if (userDisplayName && userDisplayName.trim()) {
+    systemInstruction += `\n\nThe user you are talking to is: ${userDisplayName.trim()}. Address them by name in your first message.`;
+  }
+  const model = genAI.getGenerativeModel(
+    { model: MODEL, tools: [{ functionDeclarations: YOUTUBE_TOOL_DECLARATIONS }] },
+    STREAM_API_OPTIONS
+  );
+
+  const baseHistory = capHistory(history).map((m) => ({
+    role: m.role === 'user' ? 'user' : 'model',
+    parts: [{ text: m.content || '' }],
+  }));
+
+  const chatHistory = systemInstruction
+    ? [
+        {
+          role: 'user',
+          parts: [{ text: `Follow these instructions in every response:\n\n${systemInstruction}` }],
+        },
+        { role: 'model', parts: [{ text: "Got it! I'll follow those instructions." }] },
+        ...baseHistory,
+      ]
+    : baseHistory;
+
+  const chat = model.startChat({ history: chatHistory });
+
+  let msgWithContext = channelJsonSummary
+    ? `[YouTube channel JSON loaded. Summary: ${channelJsonSummary}]\n\n${newMessage}`
+    : newMessage;
+  if (imageParts.length > 0) {
+    msgWithContext = `[User attached an image as reference for image generation.] Use the generateImage tool with the user's prompt below. The attached image will be used as the reference.\n\n${msgWithContext}`;
+  }
+
+  // Send only text to the chat model. When the user attached an image, we do not send it here so that
+  // history can stay at full cap (24) without exceeding the token limit on second+ requests. The
+  // anchor image is injected in the executor (youtubeExecuteFn) when calling the image-generation API.
+  const userMsgParts = [{ text: msgWithContext }];
+
+  let response = (await chat.sendMessage(userMsgParts)).response;
+
+  const charts = [];
+  const toolCalls = [];
+  const generatedImages = [];
+
+  for (let round = 0; round < 12; round++) {
+    const parts = response.candidates?.[0]?.content?.parts || [];
+    const funcCall = parts.find((p) => p.functionCall);
+    if (!funcCall) break;
+
+    const { name, args } = funcCall.functionCall;
+    console.log('[YouTube Tool]', name, args);
+    const toolResult = await executeFn(name, args);
+    console.log('[YouTube Tool result]', toolResult);
+
+    toolCalls.push({ name, args, result: toolResult });
+
+    if (toolResult?._multipleCharts && Array.isArray(toolResult.charts)) {
+      toolResult.charts.forEach((c) => charts.push(c));
+    } else if (toolResult?._chartType) {
+      charts.push(toolResult);
+    }
+    if (toolResult?._cardType === 'play_video') {
+      charts.push(toolResult);
+    }
+    if (toolResult?._imageResult && toolResult?.imageBase64) {
+      generatedImages.push({
+        imageBase64: toolResult.imageBase64,
+        mimeType: toolResult.mimeType || 'image/png',
+        ...(toolResult.message && { message: toolResult.message }),
+      });
+    }
+
+    response = (
+      await chat.sendMessage([
+        { functionResponse: { name, response: { result: toolResult } } },
+      ])
+    ).response;
+  }
+
+  return { text: response.text(), charts, toolCalls, generatedImages };
 };

@@ -5,3 +5,69 @@
 .App {
   min-height: 100vh;
 }
+
+/* Tab bar for Chat | YouTube Channel Download */
+.app-with-tabs {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-tab-bar {
+  display: flex;
+  gap: 0;
+  padding: 0 1rem;
+  background: rgba(0, 0, 0, 0.25);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  flex-shrink: 0;
+}
+
+.app-tab {
+  padding: 0.75rem 1.25rem;
+  background: none;
+  border: none;
+  color: rgba(255, 255, 255, 0.65);
+  font-family: 'Inter', sans-serif;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color 0.2s, border-color 0.2s;
+}
+
+.app-tab:hover {
+  color: rgba(255, 255, 255, 0.9);
+}
+
+.app-tab.active {
+  color: #fff;
+  border-bottom-color: rgba(255, 255, 255, 0.5);
+}
+
+.app-tab-content {
+  flex: 1;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+}
+
+/* Keep both tab panels mounted; hide inactive so Chat state (sessions, history) is preserved when switching tabs */
+.app-tab-pane {
+  display: none;
+  flex: 1;
+  overflow: hidden;
+  flex-direction: column;
+  min-height: 0;
+}
+.app-tab-pane.active {
+  display: flex;
+}
+
+.app-tab-content .chat-layout {
+  height: 100%;
+  min-height: 0;
+}
