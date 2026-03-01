@@ -440,23 +440,36 @@ function normalizeBase64(input) {
   return s.replace(/\s/g, '');
 }
 
-// Re-encode anchor image so the API always gets a clean, standard JPEG (avoids decode/reject issues)
-const ANCHOR_MAX_PX = 1024;
-const ANCHOR_JPEG_QUALITY = 90;
+// Re-encode anchor to clean JPEG. Multiple size/quality strategies improve API acceptance.
+const ANCHOR_STRATEGIES = [
+  { maxPx: 1024, quality: 90 },
+  { maxPx: 768, quality: 85 },
+  { maxPx: 512, quality: 80 },
+];
 
-async function reencodeAnchorToJpeg(base64, mimeType) {
+async function reencodeAnchorToJpeg(base64, mimeType, maxPx = 1024, quality = 90) {
   if (!base64 || base64.length < 100) return null;
   try {
     const buf = Buffer.from(base64, 'base64');
     const out = await sharp(buf)
-      .resize(ANCHOR_MAX_PX, ANCHOR_MAX_PX, { fit: 'inside', withoutEnlargement: true })
-      .jpeg({ quality: ANCHOR_JPEG_QUALITY, mozjpeg: true })
+      .resize(maxPx, maxPx, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality, mozjpeg: true })
       .toBuffer();
     return out.toString('base64');
   } catch (e) {
-    console.warn('Anchor re-encode failed, using original:', e?.message);
+    console.warn('Anchor re-encode failed:', maxPx, quality, e?.message);
     return null;
   }
+}
+
+/** Build parts for image gen: text (with explicit "use reference" phrasing) + optional image; order textFirst or imageFirst. */
+function buildImageGenParts(textPrompt, anchorBase64, anchorMime, textFirst = true) {
+  const textPart = { text: textPrompt };
+  const imagePart = anchorBase64
+    ? { inlineData: { mimeType: anchorMime || 'image/jpeg', data: anchorBase64 } }
+    : null;
+  if (!imagePart) return [textPart];
+  return textFirst ? [textPart, imagePart] : [imagePart, textPart];
 }
 
 async function callGeminiImageGen(apiKey, parts, signal, modelName) {
@@ -509,54 +522,84 @@ app.post('/api/generate-image', async (req, res) => {
       return res.status(503).json({ error: 'Gemini API key not configured' });
     }
 
-    const textPrompt = `Generate an image: ${prompt}`;
-    let parts = [{ text: textPrompt }];
-    let normalizedAnchor = null;
-    let anchorMime = 'image/jpeg';
-    if (anchorImageBase64) {
-      const raw = normalizeBase64(anchorImageBase64);
-      if (!raw || raw.length < 100) {
-        return res.status(400).json({ error: 'The image couldn\'t be processed. Try a different photo or try again.' });
+    const textPromptTextOnly = `Generate an image: ${prompt}`;
+    const textPromptWithAnchor = `Use the reference image provided and generate an image: ${prompt}`;
+    const rawAnchor = anchorImageBase64 ? normalizeBase64(anchorImageBase64) : null;
+    if (anchorImageBase64 && (!rawAnchor || rawAnchor.length < 100)) {
+      return res.status(400).json({ error: 'The image couldn\'t be processed. Try a different photo or try again.' });
+    }
+
+    // Precompute multiple anchor encodings (smaller/simpler often accepted when larger fails)
+    const anchorEncodings = [];
+    if (rawAnchor) {
+      for (const { maxPx, quality } of ANCHOR_STRATEGIES) {
+        const encoded = await reencodeAnchorToJpeg(rawAnchor, mimeType, maxPx, quality);
+        if (encoded) anchorEncodings.push({ data: encoded, mime: 'image/jpeg' });
       }
-      // Re-encode to clean JPEG so the API reliably accepts the anchor (avoids decode/format rejections)
-      const reencoded = await reencodeAnchorToJpeg(raw, mimeType);
-      normalizedAnchor = reencoded || raw;
-      if (reencoded) anchorMime = 'image/jpeg';
-      else anchorMime = mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
-      parts.push({
-        inlineData: {
-          mimeType: anchorMime,
-          data: normalizedAnchor,
-        },
-      });
+      if (anchorEncodings.length === 0) {
+        anchorEncodings.push({ data: rawAnchor, mime: mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg' });
+      }
     }
 
     const controller = new AbortController();
-    const timeoutMs = IMAGE_GEN_TIMEOUT_MS;
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    const totalTimeoutMs = anchorEncodings.length > 0 ? 200000 : IMAGE_GEN_TIMEOUT_MS; // 200s when trying anchor strategies
+    const timeoutId = setTimeout(() => controller.abort(), totalTimeoutMs);
 
-    let result;
+    let result = null;
+    let lastError = null;
+
     try {
-      for (const model of IMAGE_GEN_MODELS) {
-        result = await callGeminiImageGen(apiKey, parts, controller.signal, model);
-        if (result.ok || (result.status !== 404 && result.status !== 400)) break;
-        console.warn('Gemini image gen model unavailable, trying next:', model, result.status);
+      if (anchorEncodings.length > 0) {
+        // Exhaust every approach: each encoding × each model × text-first and image-first
+        for (const enc of anchorEncodings) {
+          for (const model of IMAGE_GEN_MODELS) {
+            for (const textFirst of [true, false]) {
+              const parts = buildImageGenParts(textPromptWithAnchor, enc.data, enc.mime, textFirst);
+              result = await callGeminiImageGen(apiKey, parts, controller.signal, model);
+              if (result?.ok && result?.imageBase64) {
+                clearTimeout(timeoutId);
+                return res.json({ imageBase64: result.imageBase64, mimeType: result.mimeType });
+              }
+              if (!result?.ok) lastError = result;
+            }
+          }
+        }
+        result = result || lastError;
+      } else {
+        // No anchor: single prompt, try each model
+        const textOnlyParts = [{ text: textPromptTextOnly }];
+        for (const model of IMAGE_GEN_MODELS) {
+          result = await callGeminiImageGen(apiKey, textOnlyParts, controller.signal, model);
+          if (result?.ok && result?.imageBase64) {
+            clearTimeout(timeoutId);
+            return res.json({ imageBase64: result.imageBase64, mimeType: result.mimeType });
+          }
+        }
+      }
+    } catch (e) {
+      if (e?.name === 'AbortError') {
+        result = { ok: false, error: 'Request timed out' };
+      } else {
+        throw e;
       }
     } finally {
       clearTimeout(timeoutId);
     }
 
-    if (!result.ok) {
-      console.error('Gemini image gen API error:', result.status, result.error);
-      // When anchor was used and the API rejected it, try text-only so the user still gets an image
-      if (normalizedAnchor) {
+    const textPrompt = textPromptTextOnly;
+    const textOnlyParts = [{ text: textPrompt }];
+
+    if (!result?.ok) {
+      console.error('Gemini image gen API error:', result?.status, result?.error);
+      if (anchorEncodings.length > 0) {
         const retryController = new AbortController();
         const retryTimeoutId = setTimeout(() => retryController.abort(), IMAGE_GEN_RETRY_TIMEOUT_MS);
         let retryResult;
         try {
           for (const model of IMAGE_GEN_MODELS) {
-            retryResult = await callGeminiImageGen(apiKey, [{ text: textPrompt }], retryController.signal, model);
-            if (retryResult.ok || (retryResult.status !== 404 && retryResult.status !== 400)) break;
+            retryResult = await callGeminiImageGen(apiKey, textOnlyParts, retryController.signal, model);
+            if (retryResult?.ok && retryResult?.imageBase64) break;
+            if (retryResult?.status === 404 || retryResult?.status === 400) continue;
           }
         } catch (e) {
           retryResult = { ok: false };
@@ -572,10 +615,10 @@ app.post('/api/generate-image', async (req, res) => {
           });
         }
       }
-      const errStr = (result.error || '').toLowerCase();
+      const errStr = (result?.error || '').toLowerCase();
       const friendly = errStr.includes('decod') || errStr.includes('invalid image') || errStr.includes('invalid payload')
         ? 'The image couldn\'t be processed. Try a different photo or try again.'
-        : result.status === 429
+        : result?.status === 429
           ? 'Service is busy. Please try again in a moment.'
           : 'Image generation failed. Please try again.';
       return res.status(502).json({ error: friendly });
@@ -585,33 +628,30 @@ app.post('/api/generate-image', async (req, res) => {
       return res.json({
         imageBase64: result.imageBase64,
         mimeType: result.mimeType,
-        ...(result.fallbackTextOnly && { fallbackTextOnly: true }),
       });
     }
 
-    // No image returned (e.g. safety block or reference image rejected)
+    // 200 OK but no image (e.g. model returned text "I wasn't able to process that image")
     const msg = result.modelText
       ? `Model did not return an image. ${result.modelText.slice(0, 400)}`
       : 'Model did not return an image. Try a different prompt or image.';
 
-    const textOnlyParts = [{ text: textPrompt }];
-
-    if (normalizedAnchor) {
-      // Retry without reference image so user still gets an image (shorter timeout for faster feedback)
+    if (anchorEncodings.length > 0) {
       const retryController = new AbortController();
       const retryTimeoutId = setTimeout(() => retryController.abort(), IMAGE_GEN_RETRY_TIMEOUT_MS);
       let retryResult;
       try {
         for (const model of IMAGE_GEN_MODELS) {
           retryResult = await callGeminiImageGen(apiKey, textOnlyParts, retryController.signal, model);
-          if (retryResult.ok || (retryResult.status !== 404 && retryResult.status !== 400)) break;
+          if (retryResult?.ok && retryResult?.imageBase64) break;
+          if (retryResult?.status === 404 || retryResult?.status === 400) continue;
         }
       } catch (e) {
         clearTimeout(retryTimeoutId);
         return res.status(502).json({ error: msg });
       }
       clearTimeout(retryTimeoutId);
-      if (retryResult.ok && retryResult.imageBase64) {
+      if (retryResult?.ok && retryResult?.imageBase64) {
         return res.json({
           imageBase64: retryResult.imageBase64,
           mimeType: retryResult.mimeType,
@@ -627,14 +667,15 @@ app.post('/api/generate-image', async (req, res) => {
       try {
         for (const model of IMAGE_GEN_MODELS) {
           retryResult = await callGeminiImageGen(apiKey, textOnlyParts, retryController.signal, model);
-          if (retryResult.ok || (retryResult.status !== 404 && retryResult.status !== 400)) break;
+          if (retryResult?.ok && retryResult?.imageBase64) break;
+          if (retryResult?.status === 404 || retryResult?.status === 400) continue;
         }
       } catch (e) {
         clearTimeout(retryTimeoutId);
         return res.status(502).json({ error: msg });
       }
       clearTimeout(retryTimeoutId);
-      if (retryResult.ok && retryResult.imageBase64) {
+      if (retryResult?.ok && retryResult?.imageBase64) {
         return res.json({
           imageBase64: retryResult.imageBase64,
           mimeType: retryResult.mimeType,
