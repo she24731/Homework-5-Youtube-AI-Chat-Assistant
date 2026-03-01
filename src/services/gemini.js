@@ -5,7 +5,6 @@ import { YOUTUBE_TOOL_DECLARATIONS } from './youtubeTools';
 const genAI = new GoogleGenerativeAI(process.env.REACT_APP_GEMINI_API_KEY || '');
 
 const MODEL = 'gemini-2.5-flash';
-const API_OPTIONS = { apiVersion: 'v1' };
 // Streaming with tools (Google Search / code execution) must use v1beta; v1 rejects "tools" on streamGenerateContent.
 const STREAM_API_OPTIONS = { apiVersion: 'v1beta' };
 
@@ -81,7 +80,16 @@ export const streamChat = async function* (history, newMessage, imageParts = [],
     })),
   ].filter((p) => p.text !== undefined || p.inlineData !== undefined);
 
-  const result = await chat.sendMessageStream(parts);
+  const is429 = (e) => e?.message && (String(e.message).includes('429') || String(e.message).toLowerCase().includes('quota'));
+  let result;
+  try {
+    result = await chat.sendMessageStream(parts);
+  } catch (e) {
+    if (is429(e)) {
+      await new Promise((r) => setTimeout(r, 8000));
+      result = await chat.sendMessageStream(parts);
+    } else throw e;
+  }
 
   // Stream text chunks for live display
   for await (const chunk of result.stream) {

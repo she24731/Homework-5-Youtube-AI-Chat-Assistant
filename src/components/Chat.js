@@ -715,6 +715,7 @@ ${sessionSummary}${slimCsvBlock}
     };
 
     const TOOLS_TIMEOUT_MS = 300000; // 5 min — image generation with anchor can be slow
+    const STREAM_TIMEOUT_MS = 300000; // 5 min — streaming (search/code) safety net; retry below improves fluency
     const withTimeout = (promise, ms, msg) =>
       Promise.race([
         promise,
@@ -785,26 +786,45 @@ ${sessionSummary}${slimCsvBlock}
           )
         );
       } else {
-        // ── Streaming path: code execution or search ─────────────────────────
-        for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, userDisplayName(user))) {
-          if (abortRef.current) break;
-          if (chunk.type === 'text') {
-            fullContent += chunk.text;
-            const contentSnapshot = fullContent;
-            setMessages((m) =>
-              m.map((msg) => (msg.id === assistantId ? { ...msg, content: contentSnapshot } : msg))
-            );
-          } else if (chunk.type === 'fullResponse') {
-            structuredParts = chunk.parts;
-            const partsSnapshot = structuredParts;
-            setMessages((m) =>
-              m.map((msg) =>
-                msg.id === assistantId ? { ...msg, content: '', parts: partsSnapshot } : msg
-              )
-            );
-          } else if (chunk.type === 'grounding') {
-            groundingData = chunk.data;
-          }
+        // ── Streaming path: code execution or search (5 min safety net; one retry for fluency)
+        const runStream = () =>
+          withTimeout(
+            (async () => {
+              for await (const chunk of streamChat(history, promptForGemini, imageParts, useCodeExecution, userDisplayName(user))) {
+                if (abortRef.current) break;
+                if (chunk.type === 'text') {
+                  fullContent += chunk.text;
+                  const contentSnapshot = fullContent;
+                  setMessages((m) =>
+                    m.map((msg) => (msg.id === assistantId ? { ...msg, content: contentSnapshot } : msg))
+                  );
+                } else if (chunk.type === 'fullResponse') {
+                  structuredParts = chunk.parts;
+                  const partsSnapshot = structuredParts;
+                  setMessages((m) =>
+                    m.map((msg) =>
+                      msg.id === assistantId ? { ...msg, content: '', parts: partsSnapshot } : msg
+                    )
+                  );
+                } else if (chunk.type === 'grounding') {
+                  groundingData = chunk.data;
+                }
+              }
+            })(),
+            STREAM_TIMEOUT_MS,
+            'This is taking longer than usual. Please try again.'
+          );
+        try {
+          await runStream();
+        } catch (streamErr) {
+          if (abortRef.current) throw streamErr;
+          setMessages((m) =>
+            m.map((msg) => (msg.id === assistantId ? { ...msg, content: '' } : msg))
+          );
+          fullContent = '';
+          structuredParts = null;
+          groundingData = null;
+          await runStream();
         }
       }
     } catch (err) {
@@ -818,6 +838,9 @@ ${sessionSummary}${slimCsvBlock}
         m.map((msg) => (msg.id === assistantId ? { ...msg, content: errText } : msg))
       );
       fullContent = errText;
+    } finally {
+      setStreaming(false);
+      inputRef.current?.focus();
     }
 
     if (groundingData) {
@@ -855,9 +878,6 @@ ${sessionSummary}${slimCsvBlock}
         console.error('Failed to save model message', err);
       }
     }
-
-    setStreaming(false);
-    inputRef.current?.focus();
   };
 
   const removeImage = (i) => setImages((prev) => prev.filter((_, idx) => idx !== i));
