@@ -522,6 +522,30 @@ app.post('/api/generate-image', async (req, res) => {
 
     if (!result.ok) {
       console.error('Gemini image gen API error:', result.status, result.error);
+      if (normalizedAnchor) {
+        // Anchor was rejected (decode, invalid, etc.) — try text-only so user still gets an image
+        const retryController = new AbortController();
+        const retryTimeoutId = setTimeout(() => retryController.abort(), IMAGE_GEN_RETRY_TIMEOUT_MS);
+        let retryResult;
+        try {
+          for (const model of IMAGE_GEN_MODELS) {
+            retryResult = await callGeminiImageGen(apiKey, [{ text: textPrompt }], retryController.signal, model);
+            if (retryResult.ok || (retryResult.status !== 404 && retryResult.status !== 400)) break;
+          }
+        } catch (e) {
+          // ignore
+        } finally {
+          clearTimeout(retryTimeoutId);
+        }
+        if (retryResult?.ok && retryResult?.imageBase64) {
+          return res.json({
+            imageBase64: retryResult.imageBase64,
+            mimeType: retryResult.mimeType,
+            fallbackTextOnly: true,
+            message: 'Reference image could not be used; image generated from text only.',
+          });
+        }
+      }
       const errStr = (result.error || '').toLowerCase();
       const friendly = errStr.includes('decod') || errStr.includes('invalid image') || errStr.includes('invalid payload')
         ? 'The image couldn\'t be processed. Try a different photo or try again.'
