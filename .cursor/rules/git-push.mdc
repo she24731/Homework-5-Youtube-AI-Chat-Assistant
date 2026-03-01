@@ -1,0 +1,15 @@
+---
+description: After making code changes, commit and push to GitHub (origin main)
+alwaysApply: true
+---
+
+# Git: Commit and push after changes
+
+When you finish making code changes in this project:
+
+1. **Commit** the changed files with a short, clear message describing what was done.
+2. **Push** to GitHub: `git push origin main`.
+
+- Do not add or commit files the user has not asked to track (e.g. `lisa.jpg`, `.env`, build artifacts).
+- If the user explicitly says "don't push" or "don't commit", skip the push/commit.
+- Repo: https://github.com/she24731/Homework-5-Youtube-AI-Chat-Assistant
