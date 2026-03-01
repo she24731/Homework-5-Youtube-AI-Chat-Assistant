@@ -3,6 +3,7 @@ const express = require('express');
 const { MongoClient, ObjectId } = require('mongodb');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
+const sharp = require('sharp');
 
 const app = express();
 app.use(cors());
@@ -439,6 +440,25 @@ function normalizeBase64(input) {
   return s.replace(/\s/g, '');
 }
 
+// Re-encode anchor image so the API always gets a clean, standard JPEG (avoids decode/reject issues)
+const ANCHOR_MAX_PX = 1024;
+const ANCHOR_JPEG_QUALITY = 90;
+
+async function reencodeAnchorToJpeg(base64, mimeType) {
+  if (!base64 || base64.length < 100) return null;
+  try {
+    const buf = Buffer.from(base64, 'base64');
+    const out = await sharp(buf)
+      .resize(ANCHOR_MAX_PX, ANCHOR_MAX_PX, { fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: ANCHOR_JPEG_QUALITY, mozjpeg: true })
+      .toBuffer();
+    return out.toString('base64');
+  } catch (e) {
+    console.warn('Anchor re-encode failed, using original:', e?.message);
+    return null;
+  }
+}
+
 async function callGeminiImageGen(apiKey, parts, signal, modelName) {
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const body = {
@@ -492,14 +512,20 @@ app.post('/api/generate-image', async (req, res) => {
     const textPrompt = `Generate an image: ${prompt}`;
     let parts = [{ text: textPrompt }];
     let normalizedAnchor = null;
+    let anchorMime = 'image/jpeg';
     if (anchorImageBase64) {
-      normalizedAnchor = normalizeBase64(anchorImageBase64);
-      if (!normalizedAnchor || normalizedAnchor.length < 100) {
+      const raw = normalizeBase64(anchorImageBase64);
+      if (!raw || raw.length < 100) {
         return res.status(400).json({ error: 'The image couldn\'t be processed. Try a different photo or try again.' });
       }
+      // Re-encode to clean JPEG so the API reliably accepts the anchor (avoids decode/format rejections)
+      const reencoded = await reencodeAnchorToJpeg(raw, mimeType);
+      normalizedAnchor = reencoded || raw;
+      if (reencoded) anchorMime = 'image/jpeg';
+      else anchorMime = mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg';
       parts.push({
         inlineData: {
-          mimeType: mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg',
+          mimeType: anchorMime,
           data: normalizedAnchor,
         },
       });
