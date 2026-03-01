@@ -522,8 +522,8 @@ app.post('/api/generate-image', async (req, res) => {
 
     if (!result.ok) {
       console.error('Gemini image gen API error:', result.status, result.error);
+      // When anchor was used and the API rejected it, try text-only so the user still gets an image
       if (normalizedAnchor) {
-        // Anchor was rejected (decode, invalid, etc.) — try text-only so user still gets an image
         const retryController = new AbortController();
         const retryTimeoutId = setTimeout(() => retryController.abort(), IMAGE_GEN_RETRY_TIMEOUT_MS);
         let retryResult;
@@ -533,7 +533,7 @@ app.post('/api/generate-image', async (req, res) => {
             if (retryResult.ok || (retryResult.status !== 404 && retryResult.status !== 400)) break;
           }
         } catch (e) {
-          // ignore
+          retryResult = { ok: false };
         } finally {
           clearTimeout(retryTimeoutId);
         }
