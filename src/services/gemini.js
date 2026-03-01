@@ -256,7 +256,28 @@ export const chatWithYouTubeTools = async (history, newMessage, channelJsonSumma
   // anchor image is injected in the executor (youtubeExecuteFn) when calling the image-generation API.
   const userMsgParts = [{ text: msgWithContext }];
 
-  let response = (await chat.sendMessage(userMsgParts)).response;
+  const RETRY_DELAY_MS = 8000;
+  const is429 = (e) => (e?.message && (e.message.includes('429') || e.message.includes('quota') || e.message.includes('Quota exceeded')));
+
+  const sendWithRetry = async (parts) => {
+    try {
+      const r = await chat.sendMessage(parts);
+      return r.response;
+    } catch (e) {
+      if (is429(e)) {
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+        try {
+          const r = await chat.sendMessage(parts);
+          return r.response;
+        } catch (e2) {
+          throw new Error('Service is busy. Please try again in a moment.');
+        }
+      }
+      throw e;
+    }
+  };
+
+  let response = await sendWithRetry(userMsgParts);
 
   const charts = [];
   const toolCalls = [];
@@ -290,11 +311,9 @@ export const chatWithYouTubeTools = async (history, newMessage, channelJsonSumma
       });
     }
 
-    response = (
-      await chat.sendMessage([
-        { functionResponse: { name, response: { result: toolResult } } },
-      ])
-    ).response;
+    response = await sendWithRetry([
+      { functionResponse: { name, response: { result: toolResult } } },
+    ]);
   }
 
   return { text: response.text(), charts, toolCalls, generatedImages };

@@ -494,14 +494,15 @@ app.post('/api/generate-image', async (req, res) => {
     let normalizedAnchor = null;
     if (anchorImageBase64) {
       normalizedAnchor = normalizeBase64(anchorImageBase64);
-      if (normalizedAnchor) {
-        parts.push({
-          inlineData: {
-            mimeType: mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg',
-            data: normalizedAnchor,
-          },
-        });
+      if (!normalizedAnchor || normalizedAnchor.length < 100) {
+        return res.status(400).json({ error: 'The image couldn\'t be processed. Try a different photo or try again.' });
       }
+      parts.push({
+        inlineData: {
+          mimeType: mimeType && mimeType.startsWith('image/') ? mimeType : 'image/jpeg',
+          data: normalizedAnchor,
+        },
+      });
     }
 
     const controller = new AbortController();
@@ -521,9 +522,13 @@ app.post('/api/generate-image', async (req, res) => {
 
     if (!result.ok) {
       console.error('Gemini image gen API error:', result.status, result.error);
-      return res.status(502).json({
-        error: `Image generation API error: ${result.status}. ${(result.error || '').slice(0, 300)}`,
-      });
+      const errStr = (result.error || '').toLowerCase();
+      const friendly = errStr.includes('decod') || errStr.includes('invalid image') || errStr.includes('invalid payload')
+        ? 'The image couldn\'t be processed. Try a different photo or try again.'
+        : result.status === 429
+          ? 'Service is busy. Please try again in a moment.'
+          : 'Image generation failed. Please try again.';
+      return res.status(502).json({ error: friendly });
     }
 
     if (result.imageBase64) {
@@ -587,13 +592,17 @@ app.post('/api/generate-image', async (req, res) => {
       }
     }
 
-    return res.status(502).json({ error: msg });
+    const friendlyMsg = (msg || '').toLowerCase().includes('decod') || (msg || '').toLowerCase().includes('invalid')
+      ? 'The image couldn\'t be processed. Try a different photo or try again.'
+      : msg;
+    return res.status(502).json({ error: friendlyMsg });
   } catch (err) {
     console.error('Image generation error:', err);
     const isTimeout = err.name === 'AbortError' || err.message?.includes('aborted');
-    res
-      .status(isTimeout ? 504 : 500)
-      .json({ error: isTimeout ? 'Image generation timed out (90s). Try a smaller or simpler anchor image.' : (err.message || 'Image generation failed') });
+    const friendly = isTimeout
+      ? 'Request took too long. Try a smaller or simpler image.'
+      : 'Image generation failed. Please try again.';
+    res.status(isTimeout ? 504 : 500).json({ error: friendly });
   }
 });
 

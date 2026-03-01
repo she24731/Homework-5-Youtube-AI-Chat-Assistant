@@ -696,7 +696,10 @@ ${sessionSummary}${slimCsvBlock}
           });
           clearTimeout(clientTimeoutId);
           const data = await res.json();
-          if (!res.ok) return { error: data.error || 'Image generation failed' };
+          if (!res.ok) {
+            const apiErr = data.error || 'Image generation failed';
+            return { error: apiErr.length > 120 ? 'The image couldn\'t be used. Try a different photo or try again.' : apiErr };
+          }
           return {
             imageBase64: data.imageBase64,
             mimeType: data.mimeType,
@@ -704,7 +707,8 @@ ${sessionSummary}${slimCsvBlock}
             ...(data.message && { message: data.message }),
           };
         } catch (err) {
-          return { error: err.message || 'Image generation failed' };
+          const msg = err?.message || 'Image generation failed';
+          return { error: msg.length > 120 ? 'Image generation failed. Please try again.' : msg };
         }
       }
       return executeYouTubeTool(toolName, args, sessionJsonData);
@@ -804,7 +808,12 @@ ${sessionSummary}${slimCsvBlock}
         }
       }
     } catch (err) {
-      const errText = `Error: ${err.message}`;
+      const raw = err?.message || '';
+      let errText = 'Something went wrong. Please try again.';
+      if (raw.includes('429') || raw.toLowerCase().includes('quota')) errText = 'Service is busy. Please try again in a moment.';
+      else if (raw.toLowerCase().includes('decod') || raw.toLowerCase().includes('attached image') || raw.toLowerCase().includes('invalid image')) errText = 'The image couldn\'t be used. Try a different photo or try again.';
+      else if (raw.toLowerCase().includes('timeout') || raw.toLowerCase().includes('timed out')) errText = 'Request took too long. Please try again or use a smaller image.';
+      else if (raw.length > 0 && raw.length < 120 && !raw.includes('generativelanguage.googleapis.com')) errText = raw;
       setMessages((m) =>
         m.map((msg) => (msg.id === assistantId ? { ...msg, content: errText } : msg))
       );
