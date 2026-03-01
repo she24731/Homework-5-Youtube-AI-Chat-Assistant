@@ -424,8 +424,11 @@ const IMAGE_GEN_MODEL_GEMINI3 = 'gemini-3-pro-image-preview'; // best quality, 4
 const IMAGE_GEN_MODEL_EXP = 'gemini-2.0-flash-exp-image-generation';
 const IMAGE_GEN_MODEL_PREVIEW = 'gemini-2.0-flash-preview-image-generation';
 
-// Order: try Gemini 3 first, then 2.0 preview, then 2.0 exp
+// Order: try Gemini 3 first, then 2.0 preview, then 2.0 exp (same for anchor and text-only)
 const IMAGE_GEN_MODELS = [IMAGE_GEN_MODEL_GEMINI3, IMAGE_GEN_MODEL_PREVIEW, IMAGE_GEN_MODEL_EXP];
+
+const IMAGE_GEN_TIMEOUT_MS = 90000;   // 90s per attempt — fail faster so user gets feedback
+const IMAGE_GEN_RETRY_TIMEOUT_MS = 80000; // 80s for retry (text-only fallback)
 
 // Normalize base64: strip data-URL prefix, whitespace, newlines (Gemini can fail on malformed payloads)
 function normalizeBase64(input) {
@@ -502,9 +505,9 @@ app.post('/api/generate-image', async (req, res) => {
     }
 
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 120000);
+    const timeoutMs = IMAGE_GEN_TIMEOUT_MS;
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
-    // Try Gemini 3 first (best quality), then 2.0 preview, then 2.0 exp
     let result;
     try {
       for (const model of IMAGE_GEN_MODELS) {
@@ -539,9 +542,9 @@ app.post('/api/generate-image', async (req, res) => {
     const textOnlyParts = [{ text: textPrompt }];
 
     if (normalizedAnchor) {
-      // Retry without reference image so user still gets an image
+      // Retry without reference image so user still gets an image (shorter timeout for faster feedback)
       const retryController = new AbortController();
-      const retryTimeoutId = setTimeout(() => retryController.abort(), 120000);
+      const retryTimeoutId = setTimeout(() => retryController.abort(), IMAGE_GEN_RETRY_TIMEOUT_MS);
       let retryResult;
       try {
         for (const model of IMAGE_GEN_MODELS) {
@@ -564,7 +567,7 @@ app.post('/api/generate-image', async (req, res) => {
     } else {
       // Text-only: one retry so we deliver an image when possible (transient/safety can succeed on retry)
       const retryController = new AbortController();
-      const retryTimeoutId = setTimeout(() => retryController.abort(), 120000);
+      const retryTimeoutId = setTimeout(() => retryController.abort(), IMAGE_GEN_RETRY_TIMEOUT_MS);
       let retryResult;
       try {
         for (const model of IMAGE_GEN_MODELS) {
@@ -590,7 +593,7 @@ app.post('/api/generate-image', async (req, res) => {
     const isTimeout = err.name === 'AbortError' || err.message?.includes('aborted');
     res
       .status(isTimeout ? 504 : 500)
-      .json({ error: isTimeout ? 'Image generation timed out (2 min). Try a smaller or simpler anchor image.' : (err.message || 'Image generation failed') });
+      .json({ error: isTimeout ? 'Image generation timed out (90s). Try a smaller or simpler anchor image.' : (err.message || 'Image generation failed') });
   }
 });
 

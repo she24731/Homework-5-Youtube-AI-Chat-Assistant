@@ -676,12 +676,14 @@ ${sessionSummary}${slimCsvBlock}
             anchorBase64 = imageParts[0].data;
             anchorMime = imageParts[0].mimeType || 'image/png';
           }
-          // Resize anchor to max 768px so the API responds faster (text+image often times out otherwise)
+          // Resize anchor to max 512px so the API responds faster (smaller payload, less timeout risk)
           if (anchorBase64) {
-            const resized = await resizeImageBase64(anchorBase64, anchorMime, 768);
+            const resized = await resizeImageBase64(anchorBase64, anchorMime, 512);
             anchorBase64 = resized.data;
             anchorMime = resized.mimeType;
           }
+          const controller = new AbortController();
+          const clientTimeoutId = setTimeout(() => controller.abort(), 100000); // 100s — slightly above server 90s
           const res = await fetch(`${API}/api/generate-image`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -690,7 +692,9 @@ ${sessionSummary}${slimCsvBlock}
               anchorImageBase64: anchorBase64,
               mimeType: anchorMime,
             }),
+            signal: controller.signal,
           });
+          clearTimeout(clientTimeoutId);
           const data = await res.json();
           if (!res.ok) return { error: data.error || 'Image generation failed' };
           return {
